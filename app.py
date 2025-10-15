@@ -148,7 +148,7 @@ def sigma_cap_daily_from_ann_quantile(df_dt: pd.DataFrame, q_pct: int = VC_QUANT
     ceil_ann = float(np.nanpercentile(ann_vol.values, int(q_pct)))
     return ceil_ann / np.sqrt(BUS_DAYS_PER_YEAR)
 
-# ---------- γ (rolling OLS + EMA) ----------
+# ---------- γ (rolling OLS + EMA) — JAVÍTOTT: páronkénti szűrés ----------
 def _winsor(s: pd.Series, p: float):
     if p <= 0 or s.dropna().empty:
         return s
@@ -164,29 +164,54 @@ def estimate_gamma_series(F_series: pd.Series,
                           win: int = 120,
                           min_obs: int = 40,
                           ema_halflife: int = 30) -> pd.Series:
-    idx = F_series.index.intersection(sig_base_daily.index).intersection(real_vol_daily.index).intersection(L_series_full.index)
+    """
+    Rolling OLS: log(R/S) = a + gamma * log(|F|/(|F|+L)) + e
+    FONTOS: az ablakban (x,y) párokat EGYÜTT szűrjük (mindkettő véges), így X és y hossza egyező.
+    """
+    idx = (F_series.index
+           .intersection(sig_base_daily.index)
+           .intersection(real_vol_daily.index)
+           .intersection(L_series_full.index))
     if len(idx) == 0:
         return pd.Series(dtype=float, name="gamma_t")
+
     F = F_series.reindex(idx).astype(float)
     S = sig_base_daily.reindex(idx).astype(float).clip(lower=1e-10)
     R = real_vol_daily.reindex(idx).astype(float).clip(lower=1e-10)
     L = L_series_full.reindex(idx).astype(float).clip(lower=1e-8)
+
     base = (np.abs(F) / (np.abs(F) + L)).clip(lower=1e-8, upper=1-1e-8)
-    x = np.log(base); y = np.log((R / S).clip(lower=1e-8))
+    x = np.log(base)
+    y = np.log((R / S).clip(lower=1e-8))
+
     xw, yw = _winsor(x, winsor_pct), _winsor(y, winsor_pct)
 
     gam = pd.Series(index=idx, dtype=float, name="gamma_t")
     bx, by = deque(), deque()
+
     for t, (xi, yi) in enumerate(zip(xw.values, yw.values)):
         bx.append(xi); by.append(yi)
         if len(bx) > win:
             bx.popleft(); by.popleft()
-        bxx = np.array([v for v in bx if np.isfinite(v)])
-        byy = np.array([v for v in by if np.isfinite(v)])
-        if bxx.size >= min_obs and np.nanstd(bxx) > 1e-8:
-            X = np.c_[np.ones_like(bxx), bxx]
-            beta = np.linalg.lstsq(X, byy, rcond=None)[0]
-            gam.iloc[t] = float(beta[1])
+
+        # páronkénti szűrés – csak olyan (x,y), ahol mindkettő véges
+        pairs = [(u, v) for (u, v) in zip(bx, by) if np.isfinite(u) and np.isfinite(v)]
+        if len(pairs) >= min_obs:
+            bxx = np.array([u for (u, _) in pairs], dtype=float)
+            byy = np.array([v for (_, v) in pairs], dtype=float)
+            if np.nanstd(bxx) > 1e-8:
+                X = np.c_[np.ones_like(bxx), bxx]  # n×2
+                nX, ny = X.shape[0], byy.shape[0]
+                if nX == ny and nX >= 2:
+                    try:
+                        beta = np.linalg.lstsq(X, byy, rcond=None)[0]
+                        gam.iloc[t] = float(beta[1])
+                    except np.linalg.LinAlgError:
+                        gam.iloc[t] = np.nan
+                else:
+                    gam.iloc[t] = np.nan
+            else:
+                gam.iloc[t] = np.nan
         else:
             gam.iloc[t] = np.nan
 
@@ -348,7 +373,7 @@ else:
                 ax_tv.set_title("1) Opció időértéke a futamidő függvényében (Bachelier)")
                 ax_tv.set_xlabel("T (év)"); ax_tv.set_ylabel("EUR/MWh"); ax_tv.grid(True, alpha=0.35)
                 st.pyplot(fig_tv, clear_figure=True)
-        except Exception as e:
+        except Exception:
             st.error("EXCEPTION in 1) Időérték")
             st.code(traceback.format_exc())
 
@@ -366,7 +391,7 @@ else:
                 ax_intr.set_xlabel("CSS (F) – EUR/MWh"); ax_intr.set_ylabel("Belső érték (EUR/MWh)")
                 ax_intr.grid(True, alpha=0.35); ax_intr.legend(loc="upper left")
                 st.pyplot(fig_intr, clear_figure=True)
-        except Exception as e:
+        except Exception:
             st.error("EXCEPTION in 2) Belső érték")
             st.code(traceback.format_exc())
 
@@ -391,7 +416,7 @@ else:
                 st.pyplot(figv, clear_figure=True)
             else:
                 st.info("Nincs volatilitás idősor, amit rajzolni tudnánk.")
-        except Exception as e:
+        except Exception:
             st.error("EXCEPTION in 3) Volatilitás")
             st.code(traceback.format_exc())
 
@@ -412,20 +437,20 @@ else:
 
             days_grid = t_years_grid * 365.25
 
-            ok_line = verify_lengths("4) Fáklyadiagram", "mean plot", x=days_grid, y=mean_path)
-            ok_trad = verify_lengths("4) Fáklyadiagram", "trad band", x=days_grid, y1=lower_trad, y2=upper_trad)
-            ok_state= verify_lengths("4) Fáklyadiagram", "state band", x=days_grid, y1=lower_state, y2=upper_state)
+            ok_line  = verify_lengths("4) Fáklyadiagram", "mean plot", x=days_grid, y=mean_path)
+            ok_trad  = verify_lengths("4) Fáklyadiagram", "trad band", x=days_grid, y1=lower_trad,  y2=upper_trad)
+            ok_state = verify_lengths("4) Fáklyadiagram", "state band", x=days_grid, y1=lower_state, y2=upper_state)
 
             if ok_line and ok_trad and ok_state:
                 fig_fan, ax_fan = plt.subplots(figsize=(11, 3.6))
                 safe_plot(ax_fan, days_grid, mean_path, lw=1.6, label="Várható pálya (F_now)")
-                safe_fill_between(ax_fan, days_grid, lower_trad, upper_trad, alpha=0.25, label="95% CI – hagyományos σ", color="gray")
+                safe_fill_between(ax_fan, days_grid, lower_trad, upper_trad,  alpha=0.25, label="95% CI – hagyományos σ",   color="gray")
                 safe_fill_between(ax_fan, days_grid, lower_state, upper_state, alpha=0.25, label="95% CI – state-dependent σ", color="tab:blue")
                 ax_fan.set_title("4) CSS fáklyadiagram – 95% konfidenciasáv (hagyományos vs. state-dependent σ)")
                 ax_fan.set_xlabel("Hátralévő napok a lejáratig"); ax_fan.set_ylabel("CSS (EUR/MWh)")
                 ax_fan.grid(True, alpha=0.35); ax_fan.legend(loc="upper left")
                 st.pyplot(fig_fan, clear_figure=True)
-        except Exception as e:
+        except Exception:
             st.error("EXCEPTION in 4) Fáklyadiagram")
             st.code(traceback.format_exc())
 
