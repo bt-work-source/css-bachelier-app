@@ -21,14 +21,14 @@ except Exception:
 # ======= Globális konstansok =======
 BUS_DAYS_PER_YEAR = 252
 ROLL_WIN_STD      = 20         # dCSS rolling std ablak (nap)
-LEVEL_MED_WIN     = 30         # L: |CSS| 30-napos mediánja
+LEVEL_MED_WIN     = 20         # L: |CSS| **20-napos** mediánja (RMED20)
 VOL_FLOOR         = 1e-6
 GAMMA_FALLBACK    = 0.6        # ha γ rolling becslés nem áll elő
 VC_QUANTILE       = 95         # vol-cap kvantilis (évesített dCSS-vol alapján)
 
 st.set_page_config(page_title="Forward CSS – Bachelier (GARCH + state-dependent σ + ARDL mean path)", layout="wide")
 st.title("Forward CSS – Bachelier opcióárazó")
-st.caption("Volatilitás: GARCH(1,1) t-eloszlás + state-dependent skálázás (RMED30 + γ) + vol-cap (q=95). "
+st.caption("Volatilitás: GARCH(1,1) t-eloszlás + state-dependent skálázás (RMED20 + γ) + vol-cap (q=95). "
            "Fáklyadiagram mean path: ARDL/AR előrejelzés.")
 
 # ---------- Debug/diagnosztika segédek ----------
@@ -239,6 +239,7 @@ def build_state_dep_ann_vol(F_t: pd.Series, sig_t: pd.Series, CSS_all: pd.Series
     F = F_t.reindex(idx_all).astype(float)
     S = sig_t.reindex(idx_all).astype(float).clip(lower=VOL_FLOOR)
 
+    # L: |CSS| **rolling 20-napos medián**
     L_ser_full = CSS_all.abs().rolling(int(med_win)).median().bfill().fillna(CSS_all.abs().median())
     L_ser_full = L_ser_full.reindex(idx_all, method="ffill").astype(float)
 
@@ -360,7 +361,7 @@ else:
         sig_t = sig_t_full
         CSS_all = pd.Series(df_cut["css"].values, index=pd.to_datetime(df_cut["date"])).astype(float).sort_index()
 
-        # --- State-dependent σ (annualizált) az értékelési napig ---
+        # --- State-dependent σ (annualizált) az értékelési napig (RMED20 + γ) ---
         sd_series = build_state_dep_ann_vol(
             F_t=F_t, sig_t=sig_t, CSS_all=CSS_all,
             cutoff=pd.Timestamp(val_date), vc_quantile=VC_QUANTILE,
@@ -381,7 +382,7 @@ else:
         with st.expander("🛠️ Diagnosztika (idősorok állapota)"):
             diag_series_card("F_t (CSS szint)", F_t)
             diag_series_card("σ_t (GARCH napos)", sig_t)
-            diag_series_card("State-dependent σ (annualizált)", sd_series)
+            diag_series_card("State-dependent σ (évesített, RMED20+γ)", sd_series)
             diag_series_card(f"Hagyományos σ annualizált (ROLL={ROLL_WIN_STD})", ann_vol_series)
 
         # --- Opcióár (mean path nem kell hozzá) ---
@@ -389,10 +390,10 @@ else:
         intrinsic = max(F_now - float(K), 0.0) if call_put == "call" else max(float(K) - F_now, 0.0)
         time_value = max(0.0, price - intrinsic)
 
-        st.subheader("Eredmény (Bachelier, σ = GARCH + state-dependent)")
+        st.subheader("Eredmény (Bachelier, σ = GARCH + state-dependent (RMED20+γ))")
         st.markdown(
             f"**CSS (F):** `{F_now:.4f}` EUR/MWh  |  "
-            f"**σ (annualizált, state-dep):** `{sigma_ann:.6f}`  |  "
+            f"**σ (annualizált, state-dep RMED20+γ):** `{sigma_ann:.6f}`  |  "
             f"**σ (annualizált, hagyományos):** `{sigma_ann_trad:.6f}`  |  "
             f"**T (év):** `{T_years:.4f}`  |  "
             f"**K:** `{float(K):.4f}`  \n\n"
@@ -437,7 +438,7 @@ else:
             st.error("EXCEPTION in 2) Belső érték")
             st.code(traceback.format_exc())
 
-        # (3) Volatilitás idősor – state-dependent vs. hagyományos
+        # (3) Volatilitás idősor – state-dependent (RMED20+γ) vs. hagyományos
         try:
             sd_series_plot = sd_series.dropna()
             if not sd_series_plot.empty or not ann_vol_series.empty:
@@ -445,7 +446,7 @@ else:
                 if not sd_series_plot.empty:
                     x_sd = mdates.date2num(sd_series_plot.index.to_pydatetime())
                     if verify_lengths("3) Vol idősor", "state-dep plot", x=x_sd, y=sd_series_plot.values):
-                        safe_plot(axv, x_sd, sd_series_plot.values, lw=1.8, label="State-dependent σ (évesített)")
+                        safe_plot(axv, x_sd, sd_series_plot.values, lw=1.8, label="State-dependent σ (évesített, RMED20+γ)")
                 if not ann_vol_series.empty:
                     x_tr = mdates.date2num(ann_vol_series.index.to_pydatetime())
                     if verify_lengths("3) Vol idősor", "trad plot", x=x_tr, y=ann_vol_series.values):
@@ -513,7 +514,7 @@ else:
 
             if ok_p and ok_q:
                 fig_cmp, ax_cmp = plt.subplots(figsize=(11, 3.4))
-                safe_plot(ax_cmp, T_grid, price_state, lw=1.8, label="Ár – state-dependent σ")
+                safe_plot(ax_cmp, T_grid, price_state, lw=1.8, label="Ár – state-dependent σ (RMED20+γ)")
                 safe_plot(ax_cmp, T_grid, price_trad,  lw=1.4, ls="--", label="Ár – hagyományos σ")
                 ax_cmp.set_title("5) Opcióár – hagyományos vs. state-dependent σ (Bachelier)")
                 ax_cmp.set_xlabel("T (év)"); ax_cmp.set_ylabel("Opcióár (EUR/MWh)")
