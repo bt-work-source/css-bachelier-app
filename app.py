@@ -13,7 +13,7 @@ BUS_DAYS_PER_YEAR = 252
 ROLL_WIN_STD      = 20         # dCSS rolling std ablak (nap)
 LEVEL_MED_WIN     = 30         # L: |CSS| 30-napos mediánja
 VOL_FLOOR         = 1e-6
-GAMMA_FALLBACK    = 0.6        # ha γ prefix/rolling becslés nem áll elő
+GAMMA_FALLBACK    = 0.6        # ha γ rolling becslés nem áll elő
 VC_QUANTILE       = 95         # vol-cap kvantilis (évesített dCSS-vol alapján)
 
 st.set_page_config(page_title="Forward CSS – Bachelier (GARCH + state-dependent σ)", layout="wide")
@@ -50,7 +50,7 @@ def parse_csv(file) -> pd.DataFrame:
 # ---------- GARCH illesztés ----------
 def fit_garch_t(dcss: pd.Series):
     y = dcss.dropna().values
-    if len(y) < 30:  # ⇐ KÉRT MÓDOSÍTÁS: 30 megfigyeléstől is fusson
+    if len(y) < 30:  # 30 megfigyeléstől fusson
         raise ValueError("Túl rövid idősor a GARCH-hoz (≥ 30 megfigyelés szükséges).")
     am = arch_model(y, mean="zero", vol="GARCH", p=1, q=1, dist="t")
     res = am.fit(disp="off")
@@ -83,7 +83,7 @@ def sigma_cap_daily_from_ann_quantile(df_dt: pd.DataFrame, q_pct: int = VC_QUANT
     ceil_ann = float(np.nanpercentile(ann_vol.values, int(q_pct)))
     return ceil_ann / np.sqrt(BUS_DAYS_PER_YEAR)
 
-# ---------- γ becslések ----------
+# ---------- γ becslés (rolling OLS + EMA) ----------
 def _winsor(s: pd.Series, p: float):
     if p <= 0 or s.dropna().empty:
         return s
@@ -153,7 +153,6 @@ def build_state_dep_ann_vol(F_t: pd.Series, sig_t: pd.Series, CSS_all: pd.Series
     real_vol_daily = dcss.rolling(ROLL_WIN_STD).std(ddof=1) / np.sqrt(BUS_DAYS_PER_YEAR)
     real_vol_daily = real_vol_daily.reindex(idx_all)
 
-    # ⇐ KÉRT MÓDOSÍTÁS: rolling OLS γ (min_obs=40)
     gamma_series = estimate_gamma_series(
         F_series=F, sig_base_daily=S, real_vol_daily=real_vol_daily,
         L_series_full=L_ser_full,
@@ -244,9 +243,9 @@ else:
         sigma_ann = float(sd_series.dropna().iloc[-1])
         F_now = float(F_t.iloc[-1])
 
-        # --- Hagyományos évesített vol a vizuális összehasonlításhoz (ROLL_WIN_STD) ---
-        ann_vol_series = (df_cut["dcss"].rolling(ROLL_WIN_STD).std(ddof=1) * np.sqrt(BUS_DAYS_PER_YEAR)).dropna()
-        ann_vol_series.index = pd.to_datetime(df_cut.loc[ann_vol_series.index, "date"])
+        # --- Hagyományos évesített vol a vizuális összehasonlításhoz: DÁTUM INDEXRE számolva ---
+        s_dcss = df_cut.set_index(pd.to_datetime(df_cut["date"]))["dcss"].astype(float)
+        ann_vol_series = (s_dcss.rolling(ROLL_WIN_STD).std(ddof=1) * np.sqrt(BUS_DAYS_PER_YEAR)).dropna()
         sigma_ann_trad = float(ann_vol_series.iloc[-1]) if not ann_vol_series.empty else sigma_ann  # fallback
 
         # --- Opcióár ---
@@ -272,21 +271,23 @@ else:
         st.markdown("---")
         st.subheader("Vizualizációk")
 
-        # (1) Időérték T függvényében (a state-dependent σ mellett)
+        # (1) Időérték T függvényében
         T_grid = np.linspace(1e-4, max(T_years, 1e-3), 60)
         tv_curve = [max(0.0, bachelier_price(F_now, float(K), sigma_ann, t, call_put) - intrinsic) for t in T_grid]
+        T_grid_np = np.asarray(T_grid, dtype=float)
+        tv_curve_np = np.asarray(tv_curve, dtype=float)
         fig_tv, ax_tv = plt.subplots(figsize=(11, 3.0))
-        ax_tv.plot(T_grid, tv_curve, lw=1.8)
+        ax_tv.plot(T_grid_np, tv_curve_np, lw=1.8)
         ax_tv.set_title("1) Opció időértéke a futamidő függvényében (Bachelier)")
         ax_tv.set_xlabel("T (év)"); ax_tv.set_ylabel("EUR/MWh"); ax_tv.grid(True, alpha=0.35)
         st.pyplot(fig_tv, clear_figure=True)
 
-        # (2) Belső érték F függvényében (aktuális K mellett)
+        # (2) Belső érték F függvényében
         span = max(5.0, sigma_ann * sqrt(max(T_years, 1e-4)) * 6.0)
         F_grid = np.linspace(float(K) - span, float(K) + span, 200)
         intrinsic_curve = np.maximum(F_grid - float(K), 0.0) if call_put == "call" else np.maximum(float(K) - F_grid, 0.0)
         fig_intr, ax_intr = plt.subplots(figsize=(11, 3.0))
-        ax_intr.plot(F_grid, intrinsic_curve, lw=1.8, label="Belső érték")
+        ax_intr.plot(np.asarray(F_grid), np.asarray(intrinsic_curve), lw=1.8, label="Belső érték")
         ax_intr.axvline(float(K), color="gray", ls="--", lw=1.0, label="Strike K")
         ax_intr.axvline(F_now, color="tab:orange", ls=":", lw=1.2, label="Aktuális CSS (F)")
         ax_intr.set_title("2) Belső érték a CSS (F) függvényében")
@@ -294,7 +295,7 @@ else:
         ax_intr.grid(True, alpha=0.35); ax_intr.legend(loc="upper left")
         st.pyplot(fig_intr, clear_figure=True)
 
-        # (3) Volatilitás idősor – state-dependent vs. hagyományos  (⇐ sorrend módosítva: most ez a harmadik)
+        # (3) Volatilitás idősor – state-dependent vs. hagyományos
         sd_series_plot = sd_series.dropna()
         figv, axv = plt.subplots(figsize=(11, 3.6))
         if not sd_series_plot.empty:
@@ -305,22 +306,25 @@ else:
         axv.set_ylabel("σ (EUR/MWh)"); axv.set_xlabel("Dátum"); axv.grid(True, alpha=0.35); axv.legend(loc="upper left")
         st.pyplot(figv, clear_figure=True)
 
-        # (4) Fáklyadiagram: CSS Q-mérték alatti 95%-os CI jövőre (state-dep vs. hagyományos σ)
-        #     Bachelier / normál: F_t+τ ~ N(F_now, (σ_ann * sqrt(τ))^2)
-        t_years_grid = np.linspace(0.0, float(T_years), 60)
+        # (4) Fáklyadiagram: 95% CI jövőre (state-dep vs. hagyományos σ) – egyező hosszú numpy vektorokkal
+        n_steps = 60 if T_years > 0 else 2
+        t_years_grid = np.linspace(0.0, float(T_years), n_steps)
         z = norm.ppf(0.975)  # 95% kétoldali
         mean_path = np.full_like(t_years_grid, F_now, dtype=float)
 
-        sd_state = sigma_ann * np.sqrt(np.maximum(t_years_grid, 1e-9))
-        sd_trad  = sigma_ann_trad * np.sqrt(np.maximum(t_years_grid, 1e-9))
+        sd_state = sigma_ann * np.sqrt(np.maximum(t_years_grid, 1e-12))
+        sd_trad  = sigma_ann_trad * np.sqrt(np.maximum(t_years_grid, 1e-12))
 
         lower_state = mean_path - z * sd_state
         upper_state = mean_path + z * sd_state
         lower_trad  = mean_path - z * sd_trad
         upper_trad  = mean_path + z * sd_trad
 
-        # időtengely napokban, hogy üzletileg emészthetőbb legyen
         days_grid = t_years_grid * 365.25
+        # minden vektor tisztán 1D és azonos hossz
+        days_grid = np.asarray(days_grid, dtype=float)
+        lower_trad = np.asarray(lower_trad, dtype=float); upper_trad = np.asarray(upper_trad, dtype=float)
+        lower_state = np.asarray(lower_state, dtype=float); upper_state = np.asarray(upper_state, dtype=float)
 
         fig_fan, ax_fan = plt.subplots(figsize=(11, 3.6))
         ax_fan.plot(days_grid, mean_path, lw=1.6, label="Várható pálya (F_now)")
