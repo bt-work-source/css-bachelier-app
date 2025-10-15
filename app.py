@@ -5,7 +5,7 @@ from math import sqrt
 from scipy.stats import norm
 from collections import deque
 import traceback
-s
+
 from arch import arch_model
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
