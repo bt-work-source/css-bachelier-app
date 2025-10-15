@@ -5,7 +5,7 @@ from math import sqrt
 from scipy.stats import norm
 from collections import deque
 import traceback
-
+s
 from arch import arch_model
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
@@ -301,7 +301,6 @@ def forecast_path_ARDL(y: pd.Series, steps: int, pmax: int = 8) -> np.ndarray:
 
     if HAS_ARDL:
         try:
-            # ARDL exog nélkül lényegében AR(p)
             model = ARDL(endog=y, lags=p)
             res   = model.fit()
             fcast = res.forecast(steps=steps)  # shape (steps,)
@@ -309,10 +308,8 @@ def forecast_path_ARDL(y: pd.Series, steps: int, pmax: int = 8) -> np.ndarray:
         except Exception:
             pass  # fallback alább
 
-    # Fallback: AutoReg
     try:
         res = AutoReg(y, lags=p, old_names=True).fit()
-        # dynamic one-step-ahead path
         fcast = res.predict(start=len(y), end=len(y)+steps-1, dynamic=True)
         return np.concatenate(([y.iloc[-1]], np.asarray(fcast, dtype=float)))
     except Exception:
@@ -467,22 +464,17 @@ else:
 
         # (4) Fáklyadiagram: 95% CI jövőre (state-dep vs. hagyományos σ) — MEAN PATH = ARDL/AR előrejelzés
         try:
-            # idősűrűség a lejáratig
             n_steps = max(2, int(np.ceil(T_years * 60)) + 1)
             t_years_grid = np.linspace(0.0, float(T_years), n_steps)
             days_grid = t_years_grid * 365.25
 
-            # ARDL/AR előrejelzés a CSS_all sorozaton
-            fcast_path = forecast_path_ARDL(CSS_all, steps=n_steps-1)  # hossz n_steps, [y_T, y_{T+1}, ..., y_{T+steps-1}]
-            # védőellenőrzés:
+            fcast_path = forecast_path_ARDL(CSS_all, steps=n_steps-1)  # hossz n_steps
             if len(fcast_path) != n_steps:
-                # méretre igazítás, ha szükséges
                 if len(fcast_path) > n_steps:
                     fcast_path = fcast_path[:n_steps]
                 else:
                     fcast_path = np.pad(fcast_path, (0, n_steps - len(fcast_path)), constant_values=fcast_path[-1])
 
-            # CI-k a két volával – Bachelier-szerű skálázás
             z = norm.ppf(0.975)
             sd_state = sigma_ann * np.sqrt(np.maximum(t_years_grid, 1e-12))
             sd_trad  = sigma_ann_trad * np.sqrt(np.maximum(t_years_grid, 1e-12))
@@ -507,6 +499,37 @@ else:
                 st.pyplot(fig_fan, clear_figure=True)
         except Exception:
             st.error("EXCEPTION in 4) Fáklyadiagram (ARDL)")
+            st.code(traceback.format_exc())
+
+        # (5) Opcióár – hagyományos vs. state-dependent σ (T függvényében)
+        try:
+            T_grid = np.linspace(1e-4, max(T_years, 1e-3), 80)
+            price_state = [bachelier_price(F_now, float(K), sigma_ann, t, call_put) for t in T_grid]
+            price_trad  = [bachelier_price(F_now, float(K), sigma_ann_trad, t, call_put) for t in T_grid]
+            diff = np.array(price_state) - np.array(price_trad)
+
+            ok_p = verify_lengths("5) Opcióár összevetés", "state vs trad", x=T_grid, y=price_state)
+            ok_q = verify_lengths("5) Opcióár összevetés", "trad only",     x=T_grid, y=price_trad)
+
+            if ok_p and ok_q:
+                fig_cmp, ax_cmp = plt.subplots(figsize=(11, 3.4))
+                safe_plot(ax_cmp, T_grid, price_state, lw=1.8, label="Ár – state-dependent σ")
+                safe_plot(ax_cmp, T_grid, price_trad,  lw=1.4, ls="--", label="Ár – hagyományos σ")
+                ax_cmp.set_title("5) Opcióár – hagyományos vs. state-dependent σ (Bachelier)")
+                ax_cmp.set_xlabel("T (év)"); ax_cmp.set_ylabel("Opcióár (EUR/MWh)")
+                ax_cmp.grid(True, alpha=0.35); ax_cmp.legend(loc="upper left")
+
+                # különbség segéd-görbe (másodlagos tengely)
+                ax2 = ax_cmp.twinx()
+                safe_plot(ax2, T_grid, diff, lw=1.0, ls=":", label="Különbség (state − trad)")
+                ax2.set_ylabel("Különbség (EUR/MWh)")
+                # közös legenda:
+                h1,l1 = ax_cmp.get_legend_handles_labels()
+                h2,l2 = ax2.get_legend_handles_labels()
+                ax2.legend(h1+h2, l1+l2, loc="lower right")
+                st.pyplot(fig_cmp, clear_figure=True)
+        except Exception:
+            st.error("EXCEPTION in 5) Opcióár összevetés")
             st.code(traceback.format_exc())
 
         # Mintatábla
