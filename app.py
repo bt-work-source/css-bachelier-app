@@ -4,7 +4,7 @@ import streamlit as st
 from math import sqrt
 from scipy.stats import norm
 from collections import deque
-import re
+import traceback
 
 from arch import arch_model
 import matplotlib.pyplot as plt
@@ -22,7 +22,7 @@ st.set_page_config(page_title="Forward CSS – Bachelier (GARCH + state-dependen
 st.title("Forward CSS – Bachelier opcióárazó")
 st.caption("Volatilitás: GARCH(1,1) t-eloszlás + state-dependent skálázás (RMED30 + γ) + vol-cap (q=95).")
 
-# ---------- Safe plot segédek ----------
+# ---------- Debug/diagnosztika segédek ----------
 def _to_1d_array(x):
     a = np.asarray(x)
     if a.ndim == 0:
@@ -31,18 +31,53 @@ def _to_1d_array(x):
         a = a.ravel()
     return a
 
-def _finite_mask(*arrs):
-    m = np.ones(len(arrs[0]), dtype=bool)
-    for a in arrs:
-        m &= np.isfinite(a)
-    return m
+def _count_bad(a):
+    return int(np.sum(~np.isfinite(a)))
 
+def _sample(a, k=3):
+    a = _to_1d_array(a)
+    n = len(a)
+    if n == 0: return "[]"
+    head = ", ".join([f"{a[i]!r}" for i in range(min(k,n))])
+    tail = ", ".join([f"{a[n-1-i]!r}" for i in range(min(k,n))][::-1])
+    if n <= 2*k:
+        return f"[{head}]"
+    return f"[{head}, …, {tail}]"
+
+def verify_lengths(section, plot_name, **named_arrays):
+    lens = {k: len(_to_1d_array(v)) for k,v in named_arrays.items()}
+    uniq = set(lens.values())
+    if len(uniq) == 1:
+        return True
+    # dim hiba — részletes riport
+    st.error(f"**DIMENSION ERROR** in **{section}** / **{plot_name}** — mismatched lengths: {lens}")
+    with st.expander(f"Részletek: {section} / {plot_name}", expanded=True):
+        for k, v in named_arrays.items():
+            arr = _to_1d_array(v).astype(float, copy=False)
+            st.write(f"- **{k}**: len={len(arr)}, NaN/Inf={_count_bad(arr)}; sample={_sample(arr)}")
+    return False
+
+def diag_series_card(title, s: pd.Series):
+    st.markdown(f"**{title}**")
+    if s is None or len(s)==0:
+        st.write("• üres")
+        return
+    s_non = s.dropna()
+    st.write(f"• len={len(s)}, dropna_len={len(s_non)}")
+    if hasattr(s, "index"):
+        idx = s.index
+        st.write(f"• index type={type(idx)}, is_datetime={pd.api.types.is_datetime64_any_dtype(idx)}")
+        if len(idx)>0:
+            st.write(f"• index head: {_sample(idx[:5])}")
+            st.write(f"• index tail: {_sample(idx[-5:])}")
+
+# ---------- Safe plot (hossz- és NaN-szűrés) ----------
 def safe_plot(ax, x, y, *args, **kwargs):
     X = _to_1d_array(x).astype(float, copy=False)
     Y = _to_1d_array(y).astype(float, copy=False)
     n = min(len(X), len(Y))
     X, Y = X[:n], Y[:n]
-    msk = _finite_mask(X, Y)
+    msk = np.isfinite(X) & np.isfinite(Y)
     return ax.plot(X[msk], Y[msk], *args, **kwargs)
 
 def safe_fill_between(ax, x, y1, y2, *args, **kwargs):
@@ -51,7 +86,7 @@ def safe_fill_between(ax, x, y1, y2, *args, **kwargs):
     Y2 = _to_1d_array(y2).astype(float, copy=False)
     n = min(len(X), len(Y1), len(Y2))
     X, Y1, Y2 = X[:n], Y1[:n], Y2[:n]
-    msk = _finite_mask(X, Y1, Y2)
+    msk = np.isfinite(X) & np.isfinite(Y1) & np.isfinite(Y2)
     return ax.fill_between(X[msk], Y1[msk], Y2[msk], *args, **kwargs)
 
 # ---------- Segédek: beolvasás ----------
@@ -268,8 +303,6 @@ else:
         )
         if sd_series.dropna().empty:
             st.error("A state-dependent σ nem számolható az adott adaton.")
-            st.stop()
-
         sigma_ann = float(sd_series.dropna().iloc[-1])
         F_now = float(F_t.iloc[-1])
 
@@ -277,6 +310,13 @@ else:
         s_dcss = df_cut.set_index(pd.to_datetime(df_cut["date"]))["dcss"].astype(float)
         ann_vol_series = (s_dcss.rolling(ROLL_WIN_STD).std(ddof=1) * np.sqrt(BUS_DAYS_PER_YEAR)).dropna()
         sigma_ann_trad = float(ann_vol_series.iloc[-1]) if not ann_vol_series.empty else sigma_ann  # fallback
+
+        # --- Diagnosztikai panel ---
+        with st.expander("🛠️ Diagnosztika (idősorok állapota)"):
+            diag_series_card("F_t (CSS szint)", F_t)
+            diag_series_card("σ_t (GARCH napos)", sig_t)
+            diag_series_card("State-dependent σ (annualizált)", sd_series)
+            diag_series_card(f"Hagyományos σ annualizált (ROLL={ROLL_WIN_STD})", ann_vol_series)
 
         # --- Opcióár ---
         price = bachelier_price(F_now, float(K), sigma_ann, float(T_years), call_put)
@@ -302,49 +342,58 @@ else:
         try:
             T_grid = np.linspace(1e-4, max(T_years, 1e-3), 60)
             tv_curve = [max(0.0, bachelier_price(F_now, float(K), sigma_ann, t, call_put) - intrinsic) for t in T_grid]
-            fig_tv, ax_tv = plt.subplots(figsize=(11, 3.0))
-            safe_plot(ax_tv, T_grid, tv_curve, lw=1.8)
-            ax_tv.set_title("1) Opció időértéke a futamidő függvényében (Bachelier)")
-            ax_tv.set_xlabel("T (év)"); ax_tv.set_ylabel("EUR/MWh"); ax_tv.grid(True, alpha=0.35)
-            st.pyplot(fig_tv, clear_figure=True)
+            if verify_lengths("1) Időérték", "plot", x=T_grid, y=tv_curve):
+                fig_tv, ax_tv = plt.subplots(figsize=(11, 3.0))
+                safe_plot(ax_tv, T_grid, tv_curve, lw=1.8)
+                ax_tv.set_title("1) Opció időértéke a futamidő függvényében (Bachelier)")
+                ax_tv.set_xlabel("T (év)"); ax_tv.set_ylabel("EUR/MWh"); ax_tv.grid(True, alpha=0.35)
+                st.pyplot(fig_tv, clear_figure=True)
         except Exception as e:
-            st.error(f"Időérték-görbe rajzolási hiba: {e}")
+            st.error("EXCEPTION in 1) Időérték")
+            st.code(traceback.format_exc())
 
         # (2) Belső érték F függvényében
         try:
             span = max(5.0, sigma_ann * sqrt(max(T_years, 1e-4)) * 6.0)
             F_grid = np.linspace(float(K) - span, float(K) + span, 200)
             intrinsic_curve = np.maximum(F_grid - float(K), 0.0) if call_put == "call" else np.maximum(float(K) - F_grid, 0.0)
-            fig_intr, ax_intr = plt.subplots(figsize=(11, 3.0))
-            safe_plot(ax_intr, F_grid, intrinsic_curve, lw=1.8, label="Belső érték")
-            ax_intr.axvline(float(K), color="gray", ls="--", lw=1.0, label="Strike K")
-            ax_intr.axvline(F_now, color="tab:orange", ls=":", lw=1.2, label="Aktuális CSS (F)")
-            ax_intr.set_title("2) Belső érték a CSS (F) függvényében")
-            ax_intr.set_xlabel("CSS (F) – EUR/MWh"); ax_intr.set_ylabel("Belső érték (EUR/MWh)")
-            ax_intr.grid(True, alpha=0.35); ax_intr.legend(loc="upper left")
-            st.pyplot(fig_intr, clear_figure=True)
+            if verify_lengths("2) Belső érték", "plot", x=F_grid, y=intrinsic_curve):
+                fig_intr, ax_intr = plt.subplots(figsize=(11, 3.0))
+                safe_plot(ax_intr, F_grid, intrinsic_curve, lw=1.8, label="Belső érték")
+                ax_intr.axvline(float(K), color="gray", ls="--", lw=1.0, label="Strike K")
+                ax_intr.axvline(F_now, color="tab:orange", ls=":", lw=1.2, label="Aktuális CSS (F)")
+                ax_intr.set_title("2) Belső érték a CSS (F) függvényében")
+                ax_intr.set_xlabel("CSS (F) – EUR/MWh"); ax_intr.set_ylabel("Belső érték (EUR/MWh)")
+                ax_intr.grid(True, alpha=0.35); ax_intr.legend(loc="upper left")
+                st.pyplot(fig_intr, clear_figure=True)
         except Exception as e:
-            st.error(f"Belső érték-görbe rajzolási hiba: {e}")
+            st.error("EXCEPTION in 2) Belső érték")
+            st.code(traceback.format_exc())
 
-        # (3) Volatilitás idősor – state-dependent vs. hagyományos (dátum → mdates)
+        # (3) Volatilitás idősor – state-dependent vs. hagyományos
         try:
             sd_series_plot = sd_series.dropna()
-            figv, axv = plt.subplots(figsize=(11, 3.6))
-            if not sd_series_plot.empty:
-                x_sd = mdates.date2num(sd_series_plot.index.to_pydatetime())
-                safe_plot(axv, x_sd, sd_series_plot.values, lw=1.8, label="State-dependent σ (évesített)")
-            if not ann_vol_series.empty:
-                x_tr = mdates.date2num(ann_vol_series.index.to_pydatetime())
-                safe_plot(axv, x_tr, ann_vol_series.values, lw=1.2, ls="--", label=f"Hagyományos σ (dCSS, {ROLL_WIN_STD}n)")
-            axv.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
-            axv.set_title("3) Évesített volatilitás – értékelési napig")
-            axv.set_ylabel("σ (EUR/MWh)"); axv.set_xlabel("Dátum")
-            axv.grid(True, alpha=0.35); axv.legend(loc="upper left")
-            figv.autofmt_xdate()
-            st.pyplot(figv, clear_figure=True)
+            if not sd_series_plot.empty or not ann_vol_series.empty:
+                figv, axv = plt.subplots(figsize=(11, 3.6))
+                if not sd_series_plot.empty:
+                    x_sd = mdates.date2num(sd_series_plot.index.to_pydatetime())
+                    if verify_lengths("3) Vol idősor", "state-dep plot", x=x_sd, y=sd_series_plot.values):
+                        safe_plot(axv, x_sd, sd_series_plot.values, lw=1.8, label="State-dependent σ (évesített)")
+                if not ann_vol_series.empty:
+                    x_tr = mdates.date2num(ann_vol_series.index.to_pydatetime())
+                    if verify_lengths("3) Vol idősor", "trad plot", x=x_tr, y=ann_vol_series.values):
+                        safe_plot(axv, x_tr, ann_vol_series.values, lw=1.2, ls="--", label=f"Hagyományos σ (dCSS, {ROLL_WIN_STD}n)")
+                axv.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+                axv.set_title("3) Évesített volatilitás – értékelési napig")
+                axv.set_ylabel("σ (EUR/MWh)"); axv.set_xlabel("Dátum")
+                axv.grid(True, alpha=0.35); axv.legend(loc="upper left")
+                figv.autofmt_xdate()
+                st.pyplot(figv, clear_figure=True)
+            else:
+                st.info("Nincs volatilitás idősor, amit rajzolni tudnánk.")
         except Exception as e:
-            st.error(f"Volatilitás-grafikon rajzolási hiba: {e}")
-            st.write("sd_series len:", len(sd_series.dropna()), "ann_vol_series len:", len(ann_vol_series))
+            st.error("EXCEPTION in 3) Volatilitás")
+            st.code(traceback.format_exc())
 
         # (4) Fáklyadiagram: 95% CI jövőre (state-dep vs. hagyományos σ)
         try:
@@ -363,17 +412,22 @@ else:
 
             days_grid = t_years_grid * 365.25
 
-            fig_fan, ax_fan = plt.subplots(figsize=(11, 3.6))
-            safe_plot(ax_fan, days_grid, mean_path, lw=1.6, label="Várható pálya (F_now)")
-            safe_fill_between(ax_fan, days_grid, lower_trad, upper_trad, alpha=0.25, label="95% CI – hagyományos σ", color="gray")
-            safe_fill_between(ax_fan, days_grid, lower_state, upper_state, alpha=0.25, label="95% CI – state-dependent σ", color="tab:blue")
-            ax_fan.set_title("4) CSS fáklyadiagram – 95% konfidenciasáv (hagyományos vs. state-dependent σ)")
-            ax_fan.set_xlabel("Hátralévő napok a lejáratig"); ax_fan.set_ylabel("CSS (EUR/MWh)")
-            ax_fan.grid(True, alpha=0.35); ax_fan.legend(loc="upper left")
-            st.pyplot(fig_fan, clear_figure=True)
+            ok_line = verify_lengths("4) Fáklyadiagram", "mean plot", x=days_grid, y=mean_path)
+            ok_trad = verify_lengths("4) Fáklyadiagram", "trad band", x=days_grid, y1=lower_trad, y2=upper_trad)
+            ok_state= verify_lengths("4) Fáklyadiagram", "state band", x=days_grid, y1=lower_state, y2=upper_state)
+
+            if ok_line and ok_trad and ok_state:
+                fig_fan, ax_fan = plt.subplots(figsize=(11, 3.6))
+                safe_plot(ax_fan, days_grid, mean_path, lw=1.6, label="Várható pálya (F_now)")
+                safe_fill_between(ax_fan, days_grid, lower_trad, upper_trad, alpha=0.25, label="95% CI – hagyományos σ", color="gray")
+                safe_fill_between(ax_fan, days_grid, lower_state, upper_state, alpha=0.25, label="95% CI – state-dependent σ", color="tab:blue")
+                ax_fan.set_title("4) CSS fáklyadiagram – 95% konfidenciasáv (hagyományos vs. state-dependent σ)")
+                ax_fan.set_xlabel("Hátralévő napok a lejáratig"); ax_fan.set_ylabel("CSS (EUR/MWh)")
+                ax_fan.grid(True, alpha=0.35); ax_fan.legend(loc="upper left")
+                st.pyplot(fig_fan, clear_figure=True)
         except Exception as e:
-            st.error(f"Fáklyadiagram rajzolási hiba: {e}")
-            st.write("steps:", n_steps)
+            st.error("EXCEPTION in 4) Fáklyadiagram")
+            st.code(traceback.format_exc())
 
         # Mintatábla
         st.markdown("---")
@@ -381,4 +435,5 @@ else:
         st.dataframe(df.tail(10), use_container_width=True)
 
     except Exception as e:
-        st.error(f"Hiba: {e}")
+        st.error(f"Hiba (outer try): {e}")
+        st.code(traceback.format_exc())
