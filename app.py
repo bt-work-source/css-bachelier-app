@@ -10,6 +10,14 @@ from arch import arch_model
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
+# AR/ARDL
+from statsmodels.tsa.ar_model import AutoReg
+try:
+    from statsmodels.tsa.ardl import ARDL
+    HAS_ARDL = True
+except Exception:
+    HAS_ARDL = False
+
 # ======= Globális konstansok =======
 BUS_DAYS_PER_YEAR = 252
 ROLL_WIN_STD      = 20         # dCSS rolling std ablak (nap)
@@ -18,9 +26,10 @@ VOL_FLOOR         = 1e-6
 GAMMA_FALLBACK    = 0.6        # ha γ rolling becslés nem áll elő
 VC_QUANTILE       = 95         # vol-cap kvantilis (évesített dCSS-vol alapján)
 
-st.set_page_config(page_title="Forward CSS – Bachelier (GARCH + state-dependent σ)", layout="wide")
+st.set_page_config(page_title="Forward CSS – Bachelier (GARCH + state-dependent σ + ARDL mean path)", layout="wide")
 st.title("Forward CSS – Bachelier opcióárazó")
-st.caption("Volatilitás: GARCH(1,1) t-eloszlás + state-dependent skálázás (RMED30 + γ) + vol-cap (q=95).")
+st.caption("Volatilitás: GARCH(1,1) t-eloszlás + state-dependent skálázás (RMED30 + γ) + vol-cap (q=95). "
+           "Fáklyadiagram mean path: ARDL/AR előrejelzés.")
 
 # ---------- Debug/diagnosztika segédek ----------
 def _to_1d_array(x):
@@ -49,7 +58,6 @@ def verify_lengths(section, plot_name, **named_arrays):
     uniq = set(lens.values())
     if len(uniq) == 1:
         return True
-    # dim hiba — részletes riport
     st.error(f"**DIMENSION ERROR** in **{section}** / **{plot_name}** — mismatched lengths: {lens}")
     with st.expander(f"Részletek: {section} / {plot_name}", expanded=True):
         for k, v in named_arrays.items():
@@ -71,7 +79,7 @@ def diag_series_card(title, s: pd.Series):
             st.write(f"• index head: {_sample(idx[:5])}")
             st.write(f"• index tail: {_sample(idx[-5:])}")
 
-# ---------- Safe plot (hossz- és NaN-szűrés) ----------
+# ---------- Safe plot ----------
 def safe_plot(ax, x, y, *args, **kwargs):
     X = _to_1d_array(x).astype(float, copy=False)
     Y = _to_1d_array(y).astype(float, copy=False)
@@ -108,7 +116,7 @@ def parse_csv(file) -> pd.DataFrame:
             pd.Series(df[css_col].astype(str))
               .str.replace("\xa0", "", regex=False)
               .str.replace(" ", "", regex=False)
-              .str.replace(r"(?<=\d)\.(?=\d{3}(\D|$))", "", regex=True)  # ezer elválasztó pont
+              .str.replace(r"(?<=\d)\.(?=\d{3}(\D|$))", "", regex=True)
               .str.replace(",", ".", regex=False),
             errors="coerce"
         )
@@ -148,7 +156,7 @@ def sigma_cap_daily_from_ann_quantile(df_dt: pd.DataFrame, q_pct: int = VC_QUANT
     ceil_ann = float(np.nanpercentile(ann_vol.values, int(q_pct)))
     return ceil_ann / np.sqrt(BUS_DAYS_PER_YEAR)
 
-# ---------- γ (rolling OLS + EMA) — JAVÍTOTT: páronkénti szűrés ----------
+# ---------- γ (rolling OLS + EMA) — páronkénti szűrés ----------
 def _winsor(s: pd.Series, p: float):
     if p <= 0 or s.dropna().empty:
         return s
@@ -164,10 +172,6 @@ def estimate_gamma_series(F_series: pd.Series,
                           win: int = 120,
                           min_obs: int = 40,
                           ema_halflife: int = 30) -> pd.Series:
-    """
-    Rolling OLS: log(R/S) = a + gamma * log(|F|/(|F|+L)) + e
-    FONTOS: az ablakban (x,y) párokat EGYÜTT szűrjük (mindkettő véges), így X és y hossza egyező.
-    """
     idx = (F_series.index
            .intersection(sig_base_daily.index)
            .intersection(real_vol_daily.index)
@@ -194,7 +198,6 @@ def estimate_gamma_series(F_series: pd.Series,
         if len(bx) > win:
             bx.popleft(); by.popleft()
 
-        # páronkénti szűrés – csak olyan (x,y), ahol mindkettő véges
         pairs = [(u, v) for (u, v) in zip(bx, by) if np.isfinite(u) and np.isfinite(v)]
         if len(pairs) >= min_obs:
             bxx = np.array([u for (u, _) in pairs], dtype=float)
@@ -274,6 +277,47 @@ def bachelier_price(F, K, sigma_ann, T_years, call_put="call"):
     else:
         return float((K - F) * norm.cdf(-d) + srt * norm.pdf(d))
 
+# ---------- ARDL/AR előrejelzés a mean path-hoz ----------
+def select_ar_order_aic(y: pd.Series, pmax: int = 8) -> int:
+    y = pd.Series(y).dropna()
+    best_p, best_ic = 1, np.inf
+    for p in range(1, pmax+1):
+        try:
+            res = AutoReg(y, lags=p, old_names=True).fit()
+            ic = res.aic
+            if np.isfinite(ic) and ic < best_ic:
+                best_ic, best_p = ic, p
+        except Exception:
+            continue
+    return best_p
+
+def forecast_path_ARDL(y: pd.Series, steps: int, pmax: int = 8) -> np.ndarray:
+    """ARDL(p) (exog nélkül) forecast; ha ARDL nem elérhető, AutoReg fallback. Visszaad: [y_T, y_{T+1}, ..., y_{T+steps}] (hossz steps+1)."""
+    y = pd.Series(y).astype(float).dropna()
+    if len(y) < 20 or steps <= 0:
+        return np.array([y.iloc[-1]] + [y.iloc[-1]]*steps, dtype=float)
+
+    p = select_ar_order_aic(y, pmax=pmax)
+
+    if HAS_ARDL:
+        try:
+            # ARDL exog nélkül lényegében AR(p)
+            model = ARDL(endog=y, lags=p)
+            res   = model.fit()
+            fcast = res.forecast(steps=steps)  # shape (steps,)
+            return np.concatenate(([y.iloc[-1]], np.asarray(fcast, dtype=float)))
+        except Exception:
+            pass  # fallback alább
+
+    # Fallback: AutoReg
+    try:
+        res = AutoReg(y, lags=p, old_names=True).fit()
+        # dynamic one-step-ahead path
+        fcast = res.predict(start=len(y), end=len(y)+steps-1, dynamic=True)
+        return np.concatenate(([y.iloc[-1]], np.asarray(fcast, dtype=float)))
+    except Exception:
+        return np.array([y.iloc[-1]] + [y.iloc[-1]]*steps, dtype=float)
+
 # ---------- Oldalsáv / UI ----------
 with st.sidebar:
     st.header("Adatfeltöltés")
@@ -343,7 +387,7 @@ else:
             diag_series_card("State-dependent σ (annualizált)", sd_series)
             diag_series_card(f"Hagyományos σ annualizált (ROLL={ROLL_WIN_STD})", ann_vol_series)
 
-        # --- Opcióár ---
+        # --- Opcióár (mean path nem kell hozzá) ---
         price = bachelier_price(F_now, float(K), sigma_ann, float(T_years), call_put)
         intrinsic = max(F_now - float(K), 0.0) if call_put == "call" else max(float(K) - F_now, 0.0)
         time_value = max(0.0, price - intrinsic)
@@ -360,6 +404,7 @@ else:
             f"**Időérték:** `{time_value:.6f}`"
         )
 
+        # --- Vizualizációk ---
         st.markdown("---")
         st.subheader("Vizualizációk")
 
@@ -420,38 +465,48 @@ else:
             st.error("EXCEPTION in 3) Volatilitás")
             st.code(traceback.format_exc())
 
-        # (4) Fáklyadiagram: 95% CI jövőre (state-dep vs. hagyományos σ)
+        # (4) Fáklyadiagram: 95% CI jövőre (state-dep vs. hagyományos σ) — MEAN PATH = ARDL/AR előrejelzés
         try:
+            # idősűrűség a lejáratig
             n_steps = max(2, int(np.ceil(T_years * 60)) + 1)
             t_years_grid = np.linspace(0.0, float(T_years), n_steps)
-            z = norm.ppf(0.975)  # 95% kétoldali
-            mean_path = np.full_like(t_years_grid, F_now, dtype=float)
+            days_grid = t_years_grid * 365.25
 
+            # ARDL/AR előrejelzés a CSS_all sorozaton
+            fcast_path = forecast_path_ARDL(CSS_all, steps=n_steps-1)  # hossz n_steps, [y_T, y_{T+1}, ..., y_{T+steps-1}]
+            # védőellenőrzés:
+            if len(fcast_path) != n_steps:
+                # méretre igazítás, ha szükséges
+                if len(fcast_path) > n_steps:
+                    fcast_path = fcast_path[:n_steps]
+                else:
+                    fcast_path = np.pad(fcast_path, (0, n_steps - len(fcast_path)), constant_values=fcast_path[-1])
+
+            # CI-k a két volával – Bachelier-szerű skálázás
+            z = norm.ppf(0.975)
             sd_state = sigma_ann * np.sqrt(np.maximum(t_years_grid, 1e-12))
             sd_trad  = sigma_ann_trad * np.sqrt(np.maximum(t_years_grid, 1e-12))
 
-            lower_state = mean_path - z * sd_state
-            upper_state = mean_path + z * sd_state
-            lower_trad  = mean_path - z * sd_trad
-            upper_trad  = mean_path + z * sd_trad
+            lower_state = fcast_path - z * sd_state
+            upper_state = fcast_path + z * sd_state
+            lower_trad  = fcast_path - z * sd_trad
+            upper_trad  = fcast_path + z * sd_trad
 
-            days_grid = t_years_grid * 365.25
-
-            ok_line  = verify_lengths("4) Fáklyadiagram", "mean plot", x=days_grid, y=mean_path)
-            ok_trad  = verify_lengths("4) Fáklyadiagram", "trad band", x=days_grid, y1=lower_trad,  y2=upper_trad)
-            ok_state = verify_lengths("4) Fáklyadiagram", "state band", x=days_grid, y1=lower_state, y2=upper_state)
+            ok_line  = verify_lengths("4) Fáklyadiagram (ARDL)", "mean plot", x=days_grid, y=fcast_path)
+            ok_trad  = verify_lengths("4) Fáklyadiagram (ARDL)", "trad band", x=days_grid, y1=lower_trad,  y2=upper_trad)
+            ok_state = verify_lengths("4) Fáklyadiagram (ARDL)", "state band", x=days_grid, y1=lower_state, y2=upper_state)
 
             if ok_line and ok_trad and ok_state:
-                fig_fan, ax_fan = plt.subplots(figsize=(11, 3.6))
-                safe_plot(ax_fan, days_grid, mean_path, lw=1.6, label="Várható pálya (F_now)")
-                safe_fill_between(ax_fan, days_grid, lower_trad, upper_trad,  alpha=0.25, label="95% CI – hagyományos σ",   color="gray")
+                fig_fan, ax_fan = plt.subplots(figsize=(11, 3.8))
+                safe_plot(ax_fan, days_grid, fcast_path, lw=1.8, label=f"Mean path – {'ARDL' if HAS_ARDL else 'AR'} előrejelzés")
+                safe_fill_between(ax_fan, days_grid, lower_trad,  upper_trad,  alpha=0.25, label="95% CI – hagyományos σ",   color="gray")
                 safe_fill_between(ax_fan, days_grid, lower_state, upper_state, alpha=0.25, label="95% CI – state-dependent σ", color="tab:blue")
-                ax_fan.set_title("4) CSS fáklyadiagram – 95% konfidenciasáv (hagyományos vs. state-dependent σ)")
+                ax_fan.set_title("4) CSS fáklyadiagram – mean path: ARDL/AR forecast, 95% CI: hagyományos vs. state-dependent σ")
                 ax_fan.set_xlabel("Hátralévő napok a lejáratig"); ax_fan.set_ylabel("CSS (EUR/MWh)")
                 ax_fan.grid(True, alpha=0.35); ax_fan.legend(loc="upper left")
                 st.pyplot(fig_fan, clear_figure=True)
         except Exception:
-            st.error("EXCEPTION in 4) Fáklyadiagram")
+            st.error("EXCEPTION in 4) Fáklyadiagram (ARDL)")
             st.code(traceback.format_exc())
 
         # Mintatábla
